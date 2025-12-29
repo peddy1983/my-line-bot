@@ -8,21 +8,27 @@ const config = {
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+// 讀取 OAuth 環境變數
+const clientId = process.env.GOOGLE_CLIENT_ID;
+const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+
 const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-const auth = new google.auth.JWT(
-  credentials.client_email,
-  null,
-  credentials.private_key,
-  ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+// 設定 OAuth2 驗證 (這是關鍵！代表您本人)
+const oauth2Client = new google.auth.OAuth2(
+  clientId,
+  clientSecret,
+  "https://developers.google.com/oauthplayground"
 );
+oauth2Client.setCredentials({ refresh_token: refreshToken });
 
-const sheets = google.sheets({ version: 'v4', auth });
-const drive = google.drive({ version: 'v3', auth });
+// 使用 OAuth2 Client 初始化 Drive 和 Sheets
+const drive = google.drive({ version: 'v3', auth: oauth2Client });
+const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+
 const client = new line.Client(config);
-
 const userState = {};
 const app = express();
 
@@ -39,68 +45,77 @@ async function handleEvent(event) {
   if (event.type !== 'message') return null;
   const userId = event.source.userId;
 
+  // 1. 文字訊息處理
   if (event.message.type === 'text') {
     const text = event.message.text.trim();
+
     if (text === '驗證') {
       const isMember = await checkUserExists(userId);
-      if (isMember) return client.replyMessage(event.replyToken, { type: 'text', text: '您已是會員，若要修改請洽客服。' });
+      if (isMember) return client.replyMessage(event.replyToken, { type: 'text', text: '您已是會員。' });
       userState[userId] = { step: 'ASK_PHONE' };
-      return client.replyMessage(event.replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
+      return client.replyMessage(event.replyToken, { type: 'text', text: '請輸入手機號碼：' });
     }
+
     const state = userState[userId];
     if (state?.step === 'ASK_PHONE') {
       state.phone = text; state.step = 'ASK_LINE_ID';
-      return client.replyMessage(event.replyToken, { type: 'text', text: '收到！接著請輸入您的 LINE ID：' });
+      return client.replyMessage(event.replyToken, { type: 'text', text: '接著請輸入 LINE ID：' });
     }
     if (state?.step === 'ASK_LINE_ID') {
       state.lineId = text; state.step = 'ASK_IMAGE';
-      return client.replyMessage(event.replyToken, { type: 'text', text: '最後一步，請上傳您的個人檔案截圖：' });
+      return client.replyMessage(event.replyToken, { type: 'text', text: '最後請上傳截圖：' });
     }
   }
 
+  // 2. 圖片處理 (上傳至 Google Drive)
   if (event.message.type === 'image') {
     const state = userState[userId];
     if (state?.step === 'ASK_IMAGE') {
       try {
-        await client.pushMessage(userId, { type: 'text', text: '正在處理圖片，請稍候...' });
+        await client.pushMessage(userId, { type: 'text', text: '正在上傳至 Google Drive (使用 OAuth)...' });
+        
         const imageStream = await client.getMessageContent(event.message.id);
         const driveLink = await uploadToDrive(imageStream, userId);
+        
         await saveToSheets(userId, state.phone, state.lineId, driveLink);
+        
         delete userState[userId];
-        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已同步至系統。' });
+        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！圖片已存入您的個人雲端硬碟。' });
       } catch (error) {
-        console.error('Final Error:', error.message);
-        return client.pushMessage(userId, { type: 'text', text: '❌ 圖片上傳失敗。原因：' + error.message });
+        console.error('OAuth Drive Error:', error);
+        return client.pushMessage(userId, { type: 'text', text: '❌ 上傳失敗：' + (error.message || JSON.stringify(error)) });
       }
     }
   }
 }
 
-async function checkUserExists(userId) {
-  try {
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Sheet1!A:A' });
-    return res.data.values ? res.data.values.flat().includes(userId) : false;
-  } catch (e) { return false; }
-}
-
 async function uploadToDrive(contentStream, userId) {
   const bufferStream = new stream.PassThrough();
   contentStream.pipe(bufferStream);
-  const fileMetadata = { name: `verify_${userId}_${Date.now()}.jpg`, parents: [folderId] };
-  const media = { mimeType: 'image/jpeg', body: bufferStream };
-  
-  // 核心修復：強制啟用 supportsAllDrives 並使用正確的 metadata 指向
+
+  const fileMetadata = {
+    name: `verify_${userId}_${Date.now()}.jpg`,
+    parents: [folderId],
+  };
+
+  const media = {
+    mimeType: 'image/jpeg',
+    body: bufferStream,
+  };
+
+  // 因為是 OAuth (您本人)，直接上傳即可，不需要 supportsAllDrives
   const file = await drive.files.create({
     requestBody: fileMetadata,
     media: media,
     fields: 'id, webViewLink',
-    supportsAllDrives: true,
   });
 
+  // 設定權限公開 (讓 Sheet 能連結)
   await drive.permissions.create({
     fileId: file.data.id,
     requestBody: { role: 'reader', type: 'anyone' },
   });
+
   return file.data.webViewLink;
 }
 
@@ -113,5 +128,12 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
   });
 }
 
+async function checkUserExists(userId) {
+  try {
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Sheet1!A:A' });
+    return res.data.values ? res.data.values.flat().includes(userId) : false;
+  } catch (e) { return false; }
+}
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Bot is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Bot running on ${PORT}`));
