@@ -1,6 +1,7 @@
 const line = require('@line/bot-sdk');
 const express = require('express');
 const { google } = require('googleapis');
+const stream = require('stream');
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -9,15 +10,17 @@ const config = {
 
 const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
+const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
 const auth = new google.auth.JWT(
   credentials.client_email,
   null,
   credentials.private_key,
-  ['https://www.googleapis.com/auth/spreadsheets']
+  ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 );
 
 const sheets = google.sheets({ version: 'v4', auth });
+const drive = google.drive({ version: 'v3', auth });
 const client = new line.Client(config);
 
 const userState = {};
@@ -33,61 +36,99 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 });
 
 async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') return null;
+  if (event.type !== 'message') return null;
   const userId = event.source.userId;
-  const text = event.message.text.trim();
 
-  // 觸發驗證流程
-  if (text === '驗證') {
-    const isMember = await checkUserExists(userId);
-    if (isMember) {
-      return client.replyMessage(event.replyToken, { type: 'text', text: '您已是會員，若要修改請洽客服。' });
+  if (event.message.type === 'text') {
+    const text = event.message.text.trim();
+    if (text === '驗證') {
+      const isMember = await checkUserExists(userId);
+      if (isMember) return client.replyMessage(event.replyToken, { type: 'text', text: '您已是會員，若要修改請洽客服。' });
+      userState[userId] = { step: 'ASK_PHONE' };
+      return client.replyMessage(event.replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
     }
-    userState[userId] = { step: 'ASK_PHONE' };
-    return client.replyMessage(event.replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
+    const state = userState[userId];
+    if (state?.step === 'ASK_PHONE') {
+      state.phone = text; state.step = 'ASK_LINE_ID';
+      return client.replyMessage(event.replyToken, { type: 'text', text: '收到！接著請輸入您的 LINE ID：' });
+    }
+    if (state?.step === 'ASK_LINE_ID') {
+      state.lineId = text; state.step = 'ASK_IMAGE';
+      return client.replyMessage(event.replyToken, { type: 'text', text: '最後一步，請上傳您的個人檔案截圖：' });
+    }
   }
 
-  const state = userState[userId];
-  if (!state) return null;
-
-  // 步驟 1: 儲存手機號碼
-  if (state.step === 'ASK_PHONE') {
-    state.phone = text;
-    state.step = 'ASK_LINE_ID';
-    return client.replyMessage(event.replyToken, { type: 'text', text: '收到！接著請輸入您的 LINE ID：' });
-  }
-
-  // 步驟 2: 儲存 LINE ID 並寫入試算表
-  if (state.step === 'ASK_LINE_ID') {
-    state.lineId = text;
-    try {
-      await saveToSheets(userId, state.phone, state.lineId);
-      delete userState[userId]; // 清除狀態
-      return client.replyMessage(event.replyToken, { type: 'text', text: '✅ 驗證成功！資料已同步至試算表。' });
-    } catch (error) {
-      console.error('Sheets Error:', error.message);
-      return client.replyMessage(event.replyToken, { type: 'text', text: '❌ 寫入失敗，請確認試算表共用設定。' });
+  if (event.message.type === 'image') {
+    const state = userState[userId];
+    if (state?.step === 'ASK_IMAGE') {
+      try {
+        await client.pushMessage(userId, { type: 'text', text: '正在處理圖片，請稍候...' });
+        const imageStream = await client.getMessageContent(event.message.id);
+        
+        // 核心：上傳到雲端
+        const driveLink = await uploadToDrive(imageStream, userId);
+        
+        // 寫入試算表（包含圖片網址）
+        await saveToSheets(userId, state.phone, state.lineId, driveLink);
+        
+        delete userState[userId];
+        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料與圖片已同步至系統。' });
+      } catch (error) {
+        console.error('Final Error:', error.message);
+        return client.pushMessage(userId, { type: 'text', text: '❌ 圖片上傳失敗，請確認雲端硬碟空間或權限。' });
+      }
     }
   }
 }
 
 async function checkUserExists(userId) {
   try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: 'Sheet1!A:A',
-    });
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Sheet1!A:A' });
     return res.data.values ? res.data.values.flat().includes(userId) : false;
   } catch (e) { return false; }
 }
 
-async function saveToSheets(userId, phone, lineId) {
+async function uploadToDrive(contentStream, userId) {
+  const bufferStream = new stream.PassThrough();
+  contentStream.pipe(bufferStream);
+
+  const fileMetadata = {
+    name: `verify_${userId}_${Date.now()}.jpg`,
+    parents: [folderId],
+  };
+
+  const media = {
+    mimeType: 'image/jpeg',
+    body: bufferStream,
+  };
+
+  // 1. 建立檔案 (使用 supportsAllDrives)
+  const file = await drive.files.create({
+    requestBody: fileMetadata,
+    media: media,
+    fields: 'id, webViewLink',
+    supportsAllDrives: true,
+  });
+
+  // 2. 關鍵動作：將檔案設為「任何人皆可檢視」，這通常能解決權限造成的空間判斷問題
+  await drive.permissions.create({
+    fileId: file.data.id,
+    requestBody: {
+      role: 'reader',
+      type: 'anyone',
+    },
+  });
+
+  return file.data.webViewLink;
+}
+
+async function saveToSheets(userId, phone, lineId, imgUrl) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: 'Sheet1!A:C',
+    range: 'Sheet1!A:E',
     valueInputOption: 'USER_ENTERED',
     requestBody: {
-      values: [[userId, phone, lineId]],
+      values: [[userId, phone, lineId, imgUrl, '待審核']],
     },
   });
 }
