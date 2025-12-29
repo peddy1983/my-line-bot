@@ -64,18 +64,13 @@ async function handleEvent(event) {
       try {
         await client.pushMessage(userId, { type: 'text', text: '正在處理圖片，請稍候...' });
         const imageStream = await client.getMessageContent(event.message.id);
-        
-        // 核心：上傳到雲端
         const driveLink = await uploadToDrive(imageStream, userId);
-        
-        // 寫入試算表（包含圖片網址）
         await saveToSheets(userId, state.phone, state.lineId, driveLink);
-        
         delete userState[userId];
-        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料與圖片已同步至系統。' });
+        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已同步至系統。' });
       } catch (error) {
         console.error('Final Error:', error.message);
-        return client.pushMessage(userId, { type: 'text', text: '❌ 圖片上傳失敗，請確認雲端硬碟空間或權限。' });
+        return client.pushMessage(userId, { type: 'text', text: '❌ 圖片上傳失敗。原因：' + error.message });
       }
     }
   }
@@ -91,18 +86,10 @@ async function checkUserExists(userId) {
 async function uploadToDrive(contentStream, userId) {
   const bufferStream = new stream.PassThrough();
   contentStream.pipe(bufferStream);
-
-  const fileMetadata = {
-    name: `verify_${userId}_${Date.now()}.jpg`,
-    parents: [folderId],
-  };
-
-  const media = {
-    mimeType: 'image/jpeg',
-    body: bufferStream,
-  };
-
-  // 1. 建立檔案 (使用 supportsAllDrives)
+  const fileMetadata = { name: `verify_${userId}_${Date.now()}.jpg`, parents: [folderId] };
+  const media = { mimeType: 'image/jpeg', body: bufferStream };
+  
+  // 核心修復：強制啟用 supportsAllDrives 並使用正確的 metadata 指向
   const file = await drive.files.create({
     requestBody: fileMetadata,
     media: media,
@@ -110,15 +97,10 @@ async function uploadToDrive(contentStream, userId) {
     supportsAllDrives: true,
   });
 
-  // 2. 關鍵動作：將檔案設為「任何人皆可檢視」，這通常能解決權限造成的空間判斷問題
   await drive.permissions.create({
     fileId: file.data.id,
-    requestBody: {
-      role: 'reader',
-      type: 'anyone',
-    },
+    requestBody: { role: 'reader', type: 'anyone' },
   });
-
   return file.data.webViewLink;
 }
 
@@ -127,9 +109,7 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
     spreadsheetId,
     range: 'Sheet1!A:E',
     valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [[userId, phone, lineId, imgUrl, '待審核']],
-    },
+    requestBody: { values: [[userId, phone, lineId, imgUrl, '待審核']] },
   });
 }
 
