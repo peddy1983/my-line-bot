@@ -3,12 +3,12 @@ const express = require('express');
 const { google } = require('googleapis');
 const stream = require('stream');
 
+// 1. 基本設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// 解析 Google 憑證
 const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -31,7 +31,7 @@ app.post('/webhook', line.middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
-      console.error(err);
+      console.error('Webhook Error:', err);
       res.status(500).end();
     });
 });
@@ -40,7 +40,7 @@ async function handleEvent(event) {
   if (event.type !== 'message') return null;
   const userId = event.source.userId;
 
-  // 1. 處理文字訊息
+  // 處理文字訊息流程
   if (event.message.type === 'text') {
     const text = event.message.text.trim();
 
@@ -67,7 +67,7 @@ async function handleEvent(event) {
     }
   }
 
-  // 2. 處理圖片訊息
+  // 處理圖片上傳
   if (event.message.type === 'image') {
     const state = userState[userId];
     if (state?.step === 'ASK_IMAGE') {
@@ -80,32 +80,35 @@ async function handleEvent(event) {
         await saveToSheets(userId, state.phone, state.lineId, driveLink);
         
         delete userState[userId];
-        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已寫入系統，請等待管理員審核。' });
+        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已寫入系統。' });
       } catch (error) {
-        console.error('Error in Image Processing:', error);
-        return client.pushMessage(userId, { type: 'text', text: '❌ 發生錯誤（可能是空間或權限問題），請聯絡管理員。' });
+        console.error('Final Error Catch:', error.message);
+        return client.pushMessage(userId, { type: 'text', text: '❌ 寫入失敗。原因：' + error.message });
       }
     }
   }
 }
 
+// 檢查重複
 async function checkUserExists(userId) {
   try {
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range: 'Sheet1!A:A',
     });
-    return res.data.values ? res.data.values.flat().includes(userId) : false;
+    const rows = res.data.values;
+    return rows ? rows.flat().includes(userId) : false;
   } catch (e) { return false; }
 }
 
+// 強化的 Drive 上傳函數
 async function uploadToDrive(contentStream, userId) {
   const bufferStream = new stream.PassThrough();
   contentStream.pipe(bufferStream);
 
   const fileMetadata = {
     name: `verify_${userId}_${Date.now()}.jpg`,
-    parents: [folderId], // 將檔案存入指定資料夾
+    parents: [folderId],
   };
 
   const media = {
@@ -113,15 +116,15 @@ async function uploadToDrive(contentStream, userId) {
     body: bufferStream,
   };
 
-  // 解決 403 storageQuotaExceeded 的核心寫法
+  // 使用 requestBody 並加入 supportsAllDrives
   const file = await drive.files.create({
     requestBody: fileMetadata,
     media: media,
     fields: 'id, webViewLink',
-    supportsAllDrives: true,
+    supportsAllDrives: true, // 重要：支援共用硬碟與共用資料夾
   });
 
-  // 設定權限為公開讀取，確保連結在表格中可直接開啟
+  // 設定檔案為公開可見，確保連結可用
   await drive.permissions.create({
     fileId: file.data.id,
     requestBody: { role: 'reader', type: 'anyone' },
@@ -130,6 +133,7 @@ async function uploadToDrive(contentStream, userId) {
   return file.data.webViewLink;
 }
 
+// 寫入試算表
 async function saveToSheets(userId, phone, lineId, imgUrl) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
@@ -141,5 +145,5 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
   });
 }
 
-const PORT = process.env.PORT || 10000; // Render 預設使用 10000
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Bot is running on port ${PORT}`));
