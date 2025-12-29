@@ -8,7 +8,7 @@ const config = {
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// 解析 Google Credentials
+// 解析 Google 憑證
 const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -72,7 +72,6 @@ async function handleEvent(event) {
     const state = userState[userId];
     if (state?.step === 'ASK_IMAGE') {
       try {
-        // 先回覆使用者正在處理
         await client.pushMessage(userId, { type: 'text', text: '正在處理圖片並上傳雲端，請稍候...' });
         
         const imageStream = await client.getMessageContent(event.message.id);
@@ -81,10 +80,10 @@ async function handleEvent(event) {
         await saveToSheets(userId, state.phone, state.lineId, driveLink);
         
         delete userState[userId];
-        return client.pushMessage(userId, { type: 'text', text: '驗證成功！資料已寫入系統，請等待管理員審核。' });
+        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已寫入系統，請等待管理員審核。' });
       } catch (error) {
-        console.error('Error:', error);
-        return client.pushMessage(userId, { type: 'text', text: '發生錯誤，請稍後再試。' });
+        console.error('Error in Image Processing:', error);
+        return client.pushMessage(userId, { type: 'text', text: '❌ 發生錯誤（可能是空間或權限問題），請聯絡管理員。' });
       }
     }
   }
@@ -94,10 +93,9 @@ async function checkUserExists(userId) {
   try {
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: '工作表1!A:A',
+      range: 'Sheet1!A:A',
     });
-    const rows = res.data.values;
-    return rows ? rows.flat().includes(userId) : false;
+    return res.data.values ? res.data.values.flat().includes(userId) : false;
   } catch (e) { return false; }
 }
 
@@ -106,18 +104,24 @@ async function uploadToDrive(contentStream, userId) {
   contentStream.pipe(bufferStream);
 
   const fileMetadata = {
-    name: `verify_${userId}.jpg`,
-    parents: [folderId],
+    name: `verify_${userId}_${Date.now()}.jpg`,
+    parents: [folderId], // 將檔案存入指定資料夾
   };
 
-  const media = { mimeType: 'image/jpeg', body: bufferStream };
+  const media = {
+    mimeType: 'image/jpeg',
+    body: bufferStream,
+  };
 
+  // 解決 403 storageQuotaExceeded 的核心寫法
   const file = await drive.files.create({
-    resource: fileMetadata,
+    requestBody: fileMetadata,
     media: media,
     fields: 'id, webViewLink',
+    supportsAllDrives: true,
   });
 
+  // 設定權限為公開讀取，確保連結在表格中可直接開啟
   await drive.permissions.create({
     fileId: file.data.id,
     requestBody: { role: 'reader', type: 'anyone' },
@@ -129,7 +133,7 @@ async function uploadToDrive(contentStream, userId) {
 async function saveToSheets(userId, phone, lineId, imgUrl) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: '工作表1!A:E',
+    range: 'Sheet1!A:E',
     valueInputOption: 'USER_ENTERED',
     requestBody: {
       values: [[userId, phone, lineId, imgUrl, '待審核']],
@@ -137,5 +141,5 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
   });
 }
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // Render 預設使用 10000
 app.listen(PORT, () => console.log(`Bot is running on port ${PORT}`));
