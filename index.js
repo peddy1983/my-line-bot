@@ -1,7 +1,6 @@
 const line = require('@line/bot-sdk');
 const express = require('express');
 const { google } = require('googleapis');
-const stream = require('stream');
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -10,17 +9,15 @@ const config = {
 
 const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
-const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
 const auth = new google.auth.JWT(
   credentials.client_email,
   null,
   credentials.private_key,
-  ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+  ['https://www.googleapis.com/auth/spreadsheets']
 );
 
 const sheets = google.sheets({ version: 'v4', auth });
-const drive = google.drive({ version: 'v3', auth });
 const client = new line.Client(config);
 
 const userState = {};
@@ -36,93 +33,62 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 });
 
 async function handleEvent(event) {
-  if (event.type !== 'message') return null;
+  if (event.type !== 'message' || event.message.type !== 'text') return null;
   const userId = event.source.userId;
+  const text = event.message.text.trim();
 
-  if (event.message.type === 'text') {
-    const text = event.message.text.trim();
-    if (text === '驗證') {
-      const isMember = await checkUserExists(userId);
-      if (isMember) return client.replyMessage(event.replyToken, { type: 'text', text: '您已是會員，若要修改請洽客服。' });
-      userState[userId] = { step: 'ASK_PHONE' };
-      return client.replyMessage(event.replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
+  // 觸發驗證流程
+  if (text === '驗證') {
+    const isMember = await checkUserExists(userId);
+    if (isMember) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: '您已是會員，若要修改請洽客服。' });
     }
-    const state = userState[userId];
-    if (state?.step === 'ASK_PHONE') {
-      state.phone = text; state.step = 'ASK_LINE_ID';
-      return client.replyMessage(event.replyToken, { type: 'text', text: '收到！接著請輸入您的 LINE ID：' });
-    }
-    if (state?.step === 'ASK_LINE_ID') {
-      state.lineId = text; state.step = 'ASK_IMAGE';
-      return client.replyMessage(event.replyToken, { type: 'text', text: '最後一步，請上傳您的個人檔案截圖：' });
-    }
+    userState[userId] = { step: 'ASK_PHONE' };
+    return client.replyMessage(event.replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
   }
 
-  if (event.message.type === 'image') {
-    const state = userState[userId];
-    if (state?.step === 'ASK_IMAGE') {
-      try {
-        await client.pushMessage(userId, { type: 'text', text: '正在處理圖片並上傳雲端，請稍候...' });
-        const imageStream = await client.getMessageContent(event.message.id);
-        
-        // 核心修正：使用 multipart 上傳並強制指定 parents
-        const driveLink = await uploadToDrive(imageStream, userId);
-        
-        await saveToSheets(userId, state.phone, state.lineId, driveLink);
-        delete userState[userId];
-        return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已寫入系統。' });
-      } catch (error) {
-        console.error('Final Error Catch:', error.message);
-        return client.pushMessage(userId, { type: 'text', text: '❌ 寫入失敗。原因：' + error.message });
-      }
+  const state = userState[userId];
+  if (!state) return null;
+
+  // 步驟 1: 儲存手機號碼
+  if (state.step === 'ASK_PHONE') {
+    state.phone = text;
+    state.step = 'ASK_LINE_ID';
+    return client.replyMessage(event.replyToken, { type: 'text', text: '收到！接著請輸入您的 LINE ID：' });
+  }
+
+  // 步驟 2: 儲存 LINE ID 並寫入試算表
+  if (state.step === 'ASK_LINE_ID') {
+    state.lineId = text;
+    try {
+      await saveToSheets(userId, state.phone, state.lineId);
+      delete userState[userId]; // 清除狀態
+      return client.replyMessage(event.replyToken, { type: 'text', text: '✅ 驗證成功！資料已同步至試算表。' });
+    } catch (error) {
+      console.error('Sheets Error:', error.message);
+      return client.replyMessage(event.replyToken, { type: 'text', text: '❌ 寫入失敗，請確認試算表共用設定。' });
     }
   }
 }
 
 async function checkUserExists(userId) {
   try {
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Sheet1!A:A' });
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: 'Sheet1!A:A',
+    });
     return res.data.values ? res.data.values.flat().includes(userId) : false;
   } catch (e) { return false; }
 }
 
-async function uploadToDrive(contentStream, userId) {
-  const bufferStream = new stream.PassThrough();
-  contentStream.pipe(bufferStream);
-
-  const fileMetadata = {
-    name: `verify_${userId}_${Date.now()}.jpg`,
-    parents: [folderId], // 確保檔案上傳至您的個人資料夾
-  };
-
-  const media = {
-    mimeType: 'image/jpeg',
-    body: bufferStream,
-  };
-
-  // 使用 API 建立檔案，並開啟 supportsAllDrives
-  const file = await drive.files.create({
-    requestBody: fileMetadata,
-    media: media,
-    fields: 'id, webViewLink',
-    supportsAllDrives: true,
-  });
-
-  // 設定檔案權限為公開，解決連結無法開啟的問題
-  await drive.permissions.create({
-    fileId: file.data.id,
-    requestBody: { role: 'reader', type: 'anyone' },
-  });
-
-  return file.data.webViewLink;
-}
-
-async function saveToSheets(userId, phone, lineId, imgUrl) {
+async function saveToSheets(userId, phone, lineId) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: 'Sheet1!A:E',
+    range: 'Sheet1!A:C',
     valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[userId, phone, lineId, imgUrl, '待審核']] },
+    requestBody: {
+      values: [[userId, phone, lineId]],
+    },
   });
 }
 
