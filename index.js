@@ -64,12 +64,15 @@ async function handleEvent(event) {
       try {
         await client.pushMessage(userId, { type: 'text', text: '正在處理圖片並上傳雲端，請稍候...' });
         const imageStream = await client.getMessageContent(event.message.id);
+        
+        // 核心修正：使用 multipart 上傳並強制指定 parents
         const driveLink = await uploadToDrive(imageStream, userId);
+        
         await saveToSheets(userId, state.phone, state.lineId, driveLink);
         delete userState[userId];
         return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已寫入系統。' });
       } catch (error) {
-        console.error('Final Error:', error.message);
+        console.error('Final Error Catch:', error.message);
         return client.pushMessage(userId, { type: 'text', text: '❌ 寫入失敗。原因：' + error.message });
       }
     }
@@ -89,7 +92,7 @@ async function uploadToDrive(contentStream, userId) {
 
   const fileMetadata = {
     name: `verify_${userId}_${Date.now()}.jpg`,
-    parents: [folderId]
+    parents: [folderId], // 確保檔案上傳至您的個人資料夾
   };
 
   const media = {
@@ -97,7 +100,7 @@ async function uploadToDrive(contentStream, userId) {
     body: bufferStream,
   };
 
-  // 核心修復：使用 requestBody 並強制 supportsAllDrives 確保檔案寄宿在你的空間
+  // 使用 API 建立檔案，並開啟 supportsAllDrives
   const file = await drive.files.create({
     requestBody: fileMetadata,
     media: media,
@@ -105,10 +108,12 @@ async function uploadToDrive(contentStream, userId) {
     supportsAllDrives: true,
   });
 
+  // 設定檔案權限為公開，解決連結無法開啟的問題
   await drive.permissions.create({
     fileId: file.data.id,
     requestBody: { role: 'reader', type: 'anyone' },
   });
+
   return file.data.webViewLink;
 }
 
