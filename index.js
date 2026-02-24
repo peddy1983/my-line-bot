@@ -26,6 +26,7 @@ const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const userState = {};
 const app = express();
 
+// Vercel 不需要 ping 路由，但保留不影響
 app.get('/ping', (req, res) => res.status(200).send('Bot is awake!'));
 
 app.post('/webhook', line.middleware(config), (req, res) => {
@@ -37,7 +38,7 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     });
 });
 
-// --- 核心邏輯：開始驗證流程 ---
+// --- 核心邏輯 ---
 async function startVerificationFlow(userId, replyToken) {
   const isMember = await checkUserExists(userId);
   if (isMember) {
@@ -50,18 +51,14 @@ async function startVerificationFlow(userId, replyToken) {
 async function handleEvent(event) {
   const userId = event.source.userId;
 
-  // 1. 處理圖文選單按鈕 (Postback)
   if (event.type === 'postback') {
     if (event.postback.data === 'action=verify') {
       return startVerificationFlow(userId, event.replyToken);
     }
   }
 
-  // 2. 處理文字訊息
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
-    
-    // 關鍵字觸發
     if (text === '驗證' || text === '認證') {
       return startVerificationFlow(userId, event.replyToken);
     }
@@ -80,29 +77,25 @@ async function handleEvent(event) {
     }
   }
 
-  // 3. 處理圖片上傳
   if (event.type === 'message' && event.message.type === 'image') {
     const state = userState[userId];
     if (state?.step === 'ASK_IMAGE') {
       try {
-        // 立即回覆，避免 replyToken 過期
-        await client.replyMessage(event.replyToken, { type: 'text', text: '正在處理您的截圖，請稍候...' });
-        
+        await client.replyMessage(event.replyToken, { type: 'text', text: '正在上傳截圖至雲端，請稍候...' });
         const imageStream = await client.getMessageContent(event.message.id);
         const driveLink = await uploadToDrive(imageStream, userId);
         await saveToSheets(userId, state.phone, state.lineId, driveLink);
-        
         delete userState[userId];
         return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已提交審核。' });
       } catch (error) {
         console.error('❌ 處理失敗:', error);
-        return client.pushMessage(userId, { type: 'text', text: '❌ 發生錯誤，請聯絡管理員。' });
+        return client.pushMessage(userId, { type: 'text', text: '❌ 發生錯誤，請聯絡管理員檢查 Log。' });
       }
     }
   }
 }
 
-// --- 輔助函數 (保持不變) ---
+// --- 輔助函數 ---
 async function checkUserExists(userId) {
   try {
     const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Sheet1!A:A' });
@@ -129,5 +122,11 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
   });
 }
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Bot running on ${PORT}`));
+// 重要：Vercel 專用匯出
+module.exports = app;
+
+// 僅在非生產環境（例如本機開發）啟動 listen
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = 3000;
+    app.listen(PORT, () => console.log(`🚀 本機測試執行中： http://localhost:${PORT}`));
+}

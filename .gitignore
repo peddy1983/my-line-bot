@@ -4,3 +4,6 @@ node_modules/
 !package-lock.json
 get_token.js
 EMAIL.txt
+OAuth 憑證.json
+node_modules
+.env
