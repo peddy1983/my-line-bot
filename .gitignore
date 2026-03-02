@@ -7,3 +7,4 @@ EMAIL.txt
 OAuth 憑證.json
 node_modules
 .env
+.vercel

@@ -2,13 +2,14 @@ const line = require('@line/bot-sdk');
 const express = require('express');
 const { google } = require('googleapis');
 const stream = require('stream');
+const path = require('path');
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// --- OAuth2 驗證設定 ---
+// --- Google OAuth2 設定 ---
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -26,8 +27,8 @@ const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const userState = {};
 const app = express();
 
-// Vercel 不需要 ping 路由，但保留不影響
-app.get('/ping', (req, res) => res.status(200).send('Bot is awake!'));
+// 設定靜態檔案路徑，讓 Vercel 可以讀取專案內的圖片
+app.use(express.static('public'));
 
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
@@ -38,43 +39,37 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     });
 });
 
-// --- 核心邏輯 ---
-async function startVerificationFlow(userId, replyToken) {
-  const isMember = await checkUserExists(userId);
-  if (isMember) {
-    return client.replyMessage(replyToken, { type: 'text', text: '您已是會員，無須重複驗證。' });
-  }
-  userState[userId] = { step: 'ASK_PHONE' };
-  return client.replyMessage(replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
-}
-
 async function handleEvent(event) {
   const userId = event.source.userId;
 
-  // 處理 Postback (圖文選單按鈕)
+  // 1. 處理圖文選單按鈕 (Postback 類型)
   if (event.type === 'postback') {
-    // 觸發會員驗證
     if (event.postback.data === 'action=verify') {
       return startVerificationFlow(userId, event.replyToken);
     }
-    
-    // 新增：觸發回傳圖片 (請將網址更換為你實際的圖片連結)
-    if (event.postback.data === 'action=send_image') {
-      return client.replyMessage(event.replyToken, {
-        type: 'image',
-        originalContentUrl: 'https://your-domain.vercel.app/your-image.jpg', 
-        previewImageUrl: 'https://your-domain.vercel.app/your-image.jpg'
-      });
-    }
   }
 
-  // 處理文字訊息
+  // 2. 處理文字訊息 (包括圖文選單的「文字」按鈕)
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
+
+    // --- 新增：點擊「優惠資訊」按鈕回傳圖片 ---
+    if (text === '優惠資訊') {
+      // 使用你在 Vercel 的正式網域
+      const imageUrl = 'https://my-line-bot-chi.vercel.app/promo.jpg';
+      return client.replyMessage(event.replyToken, {
+        type: 'image',
+        originalContentUrl: imageUrl,
+        previewImageUrl: imageUrl
+      });
+    }
+
+    // 會員驗證啟動關鍵字
     if (text === '驗證' || text === '認證') {
       return startVerificationFlow(userId, event.replyToken);
     }
 
+    // 處理會員資料填寫流程
     const state = userState[userId];
     if (state?.step === 'ASK_PHONE') {
         state.phone = text;
@@ -89,7 +84,7 @@ async function handleEvent(event) {
     }
   }
 
-  // 處理圖片訊息 (會員上傳截圖)
+  // 3. 處理圖片上傳 (驗證截圖)
   if (event.type === 'message' && event.message.type === 'image') {
     const state = userState[userId];
     if (state?.step === 'ASK_IMAGE') {
@@ -102,13 +97,22 @@ async function handleEvent(event) {
         return client.pushMessage(userId, { type: 'text', text: '✅ 驗證成功！資料已提交審核。' });
       } catch (error) {
         console.error('❌ 處理失敗:', error);
-        return client.pushMessage(userId, { type: 'text', text: '❌ 發生錯誤，請聯絡管理員檢查 Log。' });
+        return client.pushMessage(userId, { type: 'text', text: '❌ 發生錯誤，請聯絡管理員檢查。' });
       }
     }
   }
 }
 
 // --- 輔助函數 ---
+async function startVerificationFlow(userId, replyToken) {
+  const isMember = await checkUserExists(userId);
+  if (isMember) {
+    return client.replyMessage(replyToken, { type: 'text', text: '您已是會員，無須重複驗證。' });
+  }
+  userState[userId] = { step: 'ASK_PHONE' };
+  return client.replyMessage(replyToken, { type: 'text', text: '開始會員驗證，請輸入您的手機號碼：' });
+}
+
 async function checkUserExists(userId) {
   try {
     const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Sheet1!A:A' });
@@ -135,11 +139,10 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
   });
 }
 
-// 重要：Vercel 專用匯出
+// Vercel 專用匯出
 module.exports = app;
 
-// 僅在非生產環境啟動 listen
 if (process.env.NODE_ENV !== 'production') {
     const PORT = 3000;
-    app.listen(PORT, () => console.log(`🚀 本機測試執行中： http://localhost:${PORT}`));
+    app.listen(PORT, () => console.log(`🚀 本機測試： http://localhost:${PORT}`));
 }
