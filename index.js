@@ -51,12 +51,24 @@ async function startVerificationFlow(userId, replyToken) {
 async function handleEvent(event) {
   const userId = event.source.userId;
 
+  // 處理 Postback (圖文選單按鈕)
   if (event.type === 'postback') {
+    // 觸發會員驗證
     if (event.postback.data === 'action=verify') {
       return startVerificationFlow(userId, event.replyToken);
     }
+    
+    // 新增：觸發回傳圖片 (請將網址更換為你實際的圖片連結)
+    if (event.postback.data === 'action=send_image') {
+      return client.replyMessage(event.replyToken, {
+        type: 'image',
+        originalContentUrl: 'https://your-domain.vercel.app/your-image.jpg', 
+        previewImageUrl: 'https://your-domain.vercel.app/your-image.jpg'
+      });
+    }
   }
 
+  // 處理文字訊息
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
     if (text === '驗證' || text === '認證') {
@@ -77,6 +89,7 @@ async function handleEvent(event) {
     }
   }
 
+  // 處理圖片訊息 (會員上傳截圖)
   if (event.type === 'message' && event.message.type === 'image') {
     const state = userState[userId];
     if (state?.step === 'ASK_IMAGE') {
@@ -125,7 +138,7 @@ async function saveToSheets(userId, phone, lineId, imgUrl) {
 // 重要：Vercel 專用匯出
 module.exports = app;
 
-// 僅在非生產環境（例如本機開發）啟動 listen
+// 僅在非生產環境啟動 listen
 if (process.env.NODE_ENV !== 'production') {
     const PORT = 3000;
     app.listen(PORT, () => console.log(`🚀 本機測試執行中： http://localhost:${PORT}`));
